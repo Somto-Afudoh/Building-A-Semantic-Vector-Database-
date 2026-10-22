@@ -15,8 +15,8 @@ flowchart LR
     TRANS --> FACT["Gold Parquet<br/>data/gold/fact_vectors"]
     FACT -->|"load_gold.py<br/>SentenceTransformer<br/>all-MiniLM-L6-v2"| EMB["Generate one embedding per chunk"]
     EMB --> FINAL["Parquet with embedding array<br/>data/gold/final_vector_storage"]
-    FINAL -.->|"not implemented"| VDB["Vector database / index"]
-    VDB -.->|"not implemented"| SEARCH["Semantic search service"]
+    FINAL -.->|"proposal only: qdrant_index.py"| VDB["Proposed Qdrant collection<br/>not integration-tested"]
+    VDB -.->|"proposal only: qdrant_search.py"| SEARCH["Proposed semantic query<br/>not production-verified"]
 
     classDef existing fill:#eef4ff,stroke:#5275a5,color:#14243c;
     classDef terminal fill:#fff1e6,stroke:#ed7d31,color:#40240f;
@@ -38,7 +38,7 @@ Execution order is inferred from the scripts' input/output paths. There is no sc
 | Silver | [ingestion.py](./ingestion.py) | The two Bronze globs | Read JSON, project selected fields, replace missing metadata price with `0.0`, deduplicate metadata by product key, remove reviews with null text, inner join on `parent_asin`. | `data/silver/complete_reviews` (Parquet, overwrite) |
 | Gold dimensions and chunks | [transformation.py](./transformation.py) | `./data/silver/complete_reviews` (Parquet) | Create product and user aggregates; run a Python UDF to split review text into overlapping word chunks. | `./data/gold/dim_products`, `data/gold/dim_users`, and `data/gold/fact_vectors` (Parquet, overwrite) |
 | Embedding | [load_gold.py](./load_gold.py) | `data/gold/fact_vectors` (Parquet) and the `all-MiniLM-L6-v2` model | Encode each `review_chunk`; append an embedding array. | `data/gold/final_vector_storage` (Parquet, overwrite) |
-| Index/search | Not present | Would consume embedding output | No database client, vector index, or search service is implemented in these scripts. | None |
+| Proposed index/search (unreviewed) | [qdrant_index.py](./qdrant_index.py), [qdrant_search.py](./qdrant_search.py) | Draft code proposes indexing embedding rows and requesting nearest neighbors. | No production destination is asserted; requires an explicit AeroMart architecture decision and integration testing against a provisioned service. |
 
 ### Column lineage
 
@@ -51,8 +51,10 @@ Column names below describe the code's selected/produced output, not a claim tha
 | Silver `complete_reviews` | Inner join the selected reviews to metadata on review `parent_asin` = `metadata_parent_asin`; drop the temporary `metadata_parent_asin` join column. Output columns: `parent_asin`, `user_id`, `rating`, `text`, `timestamp`, `title`, `main_category`, `price`. Unmatched reviews do not reach this output. |
 | Gold `dim_products` | Select silver `parent_asin` as `product_id`, `title` as `product_name`, and retain `main_category`, `price`; apply `distinct()` to the full selected row. Output: `product_id`, `product_name`, `main_category`, `price`. This does not guarantee one row per `product_id` when selected metadata differs. |
 | Gold `dim_users` | Group silver rows by `user_id`; create `review_count` as `count(*)` and `avg_rating_given` as `avg(rating)`. Output: `user_id`, `review_count`, `avg_rating_given`. |
-| Gold `fact_vectors` | Apply chunk UDF to silver `text`, `explode` the resulting array, select silver `parent_asin` as `product_id`, plus `user_id`, `rating`, and generated `review_chunk`. Output: `product_id`, `user_id`, `rating`, `review_chunk`. The original `text`, `timestamp`, and product metadata are not carried into this table. Reviews that produce no chunks produce no fact rows after `explode`. |
-| Gold `final_vector_storage` | Read all `fact_vectors` columns unchanged and append `embedding`, an `ArrayType(FloatType())` returned by `get_embedding`. Intended shape for the named model is a 384-value vector, but this code does not validate the dimension or vector values. Output columns: `product_id`, `user_id`, `rating`, `review_chunk`, `embedding`. |
+| Gold `fact_vectors` | Apply chunk UDF to silver `text`, `posexplode` the resulting array, select silver `parent_asin` as `product_id`, retain `user_id`, `rating`, `timestamp`, create deterministic `review_id` from review identity fields and `chunk_id` from review ID plus chunk index, and output `review_chunk`. Output: `product_id`, `user_id`, `rating`, `timestamp`, `review_id`, `chunk_id`, `review_chunk`. Reviews that produce no chunks produce no fact rows after explode. |
+| Gold `final_vector_storage` | Read all `fact_vectors` columns unchanged and append `embedding`, an `ArrayType(FloatType())` returned by `get_embedding`. Output columns: `product_id`, `user_id`, `rating`, `timestamp`, `review_id`, `chunk_id`, `review_chunk`, `embedding`. |
+| Qdrant index | `qdrant_index.py` reads `data/gold/final_vector_storage`, checks each embedding has 384 finite values, and upserts it as a point using a deterministic UUID derived from `chunk_id`. Payload includes identifiers, rating, timestamp, and review chunk text. |
+| Semantic query | `qdrant_search.py` embeds the query with `all-MiniLM-L6-v2` and asks Qdrant for the nearest points under cosine distance. Model provisioning/offline behavior is not yet addressed. |
 
 ### Active versus commented-out chunker
 
@@ -62,11 +64,11 @@ Both versions catch all exceptions and return an empty list, which can hide bad 
 
 ## Operational boundary and limitations
 
-- Writes use Parquet paths on local storage, not a relational database or vector database. `final_vector_storage` is therefore an embedding file store, not a searchable index.
+- Parquet remains the embedding staging/export output. The new indexing and query scripts target Qdrant, but require an externally provisioned and reachable on-prem Qdrant service.
 - Data is overwritten at each output path. The scripts do not show staged publication, rollback, retries, or orchestration.
 - The Bronze files are external/manual inputs. The current repository listing does not include those input files, so their row counts and schemas have not been inspected here.
 - `load_gold.py` references a model by name. The code does not document an offline model artifact location or guarantee that an on-prem server can download it.
-- The architecture describes code behavior and path-level dependencies; the pipeline was not executed as part of this milestone review.
+- The Qdrant scripts are an uncommitted proposal and have not been integration-tested against a running service. They are not a requirement or a verified end-to-end production deployment.
 
 ## Milestone progress against `CASE_STUDY.md`
 
@@ -74,7 +76,7 @@ Both versions catch all exceptions and return an empty list, which can hide bad 
 |---|---|---|
 | 1. Map the pipeline | **Complete for the map deliverables.** | This document provides a code-checked architecture, and the README has script-by-script inputs, outputs, and column lineage. The prompt log records the explanation and evidence check. |
 | 2. Audit the code | **Complete for the checklist report.** | [AUDIT_REPORT.md](./AUDIT_REPORT.md) records all 46 checklist IDs A-1 through F-4 with status, code evidence, severity, and AeroMart impact; it opens with a prioritized top five. The review is static and does not measure production behavior. |
-| 3. Propose improvements | **Not complete.** | No code changes for the top five findings or finding-linked commits are part of this milestone review. |
+| 3. Propose improvements | **In progress.** | The revised immediate pipeline priorities are C-2, C-10, B-3, B-1, and A-5 in [AUDIT_REPORT.md](./AUDIT_REPORT.md) and [OPTIMIZATION_PLAN.md](./OPTIMIZATION_PLAN.md). Uncommitted Qdrant proposal files from an earlier iteration are not accepted or integration-tested; D-2 remains a separate architecture decision. No code changes for the revised top five have yet been reviewed or committed. |
 | 4. Plan for data quality | **Not complete against the milestone's Done-when check.** | A general plan exists in the README, but a complete check-by-check `DATA_QUALITY.md` with layer, rule, failure handling, and coverage of every section C finding is still needed. |
 | 5. Document everything | **Not complete.** | The README still contains the original student notice and is not a full setup/run/limitations guide; no `DATA_DICTIONARY.md`, complete function docstrings, or Copilot reflection is present. |
 
